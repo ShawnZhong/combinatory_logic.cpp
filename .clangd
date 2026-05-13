@@ -7,3 +7,8 @@ If:
   PathMatch: template.cpp
 CompileFlags:
   Add: [-std=c++11]
+---
+If:
+  PathMatch: coc.cpp
+CompileFlags:
+  Add: [-std=c++26]
