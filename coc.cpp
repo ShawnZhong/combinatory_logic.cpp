@@ -13,55 +13,76 @@
 #include <type_traits>
 
 // =============================================================================
-// (A) AST: terms-as-types.
+// (A) AST: terms-as-types, plus the Term concept that recognises them.
 // =============================================================================
 struct Star {};                                   // *
 struct Box  {};                                   // □  (* : □)
 template <int N>                  struct Var {};  // de Bruijn index
-template <typename A, typename B> struct Lam {};  // λ:A. B   (annotation, body)
-template <typename A, typename B> struct Pi  {};  // Π:A. B   (domain, codomain)
 template <typename F, typename X> struct App {};  // F X
 
-// =============================================================================
-// (B) lift<T, D, C> : add D to every free variable of T whose index is ≥ C.
-//     Used when we splice T under D additional binders.
-// =============================================================================
-template <typename T, int D, int C = 0> struct lift_ { using type = T; };
-template <typename T, int D, int C = 0> using lift = typename lift_<T, D, C>::type;
+// Binder.  Lam and Pi share their structural recursion (lift, subst, nf-walk),
+// so they share a constructor and differ only by a tag.  The rules that *do*
+// distinguish them -- β-reduction (only Lam-headed App reduces) and inference
+// (λ's type is a Π; Π's type is its codomain's sort) -- partial-specialize
+// on the tag and stay sharp.  Construction-side, prefer the Lam / Pi aliases.
+struct LamK {};                                                   // λ tag
+struct PiK  {};                                                   // Π tag
+template <class K> concept BindKind = std::is_same_v<K, LamK> || std::is_same_v<K, PiK>;
 
-template <int N, int D, int C> struct lift_<Var<N>, D, C> {
-  using type = Var<N + D * (N >= C)>;
-};
-template <typename A, typename B, int D, int C> struct lift_<Lam<A, B>, D, C> {
-  using type = Lam<lift<A, D, C>, lift<B, D, C + 1>>;
-};
-template <typename A, typename B, int D, int C> struct lift_<Pi<A, B>, D, C> {
-  using type = Pi<lift<A, D, C>, lift<B, D, C + 1>>;
-};
-template <typename F, typename X, int D, int C> struct lift_<App<F, X>, D, C> {
-  using type = App<lift<F, D, C>, lift<X, D, C>>;
-};
+template <BindKind Kind, class A, class B> struct Bind {};        // gated by BindKind
+template <class A, class B> using Lam = Bind<LamK, A, B>;         // λ:A. B
+template <class A, class B> using Pi  = Bind<PiK,  A, B>;         // Π:A. B
+
+template <class T>                      constexpr bool is_term_v                   = false;
+template <>                             constexpr bool is_term_v<Star>             = true;
+template <>                             constexpr bool is_term_v<Box>              = true;
+template <int N>                        constexpr bool is_term_v<Var<N>>           = true;
+template <class Kind, class A, class B> constexpr bool is_term_v<Bind<Kind, A, B>> = is_term_v<A> && is_term_v<B>;
+template <class F, class X>             constexpr bool is_term_v<App<F, X>>        = is_term_v<F> && is_term_v<X>;
+
+template <class T> concept Term = is_term_v<T>;
 
 // =============================================================================
-// (C) subst<T, N, S> : in T, replace Var<N> with S, decrement free vars > N,
-//     and lift S by one each time we descend under a binder.
-//     β-rule: (Lam A B) X  →  subst<B, 0, X>.
+// (B) walk<Action, T, Depth> : structural fold over a term, threading the
+//     current binder Depth and applying Action's per-Var rule at each variable
+//     leaf.  Both lift and subst are instances of this scheme; the four-case
+//     AST recursion is written exactly once.
 // =============================================================================
-template <typename T, int N, typename S> struct subst_ { using type = T; };
-template <typename T, int N, typename S> using subst = typename subst_<T, N, S>::type;
+template <class Action> concept VarAction = requires { typename Action::template at<0, 0>; };
 
-template <int K, int N, typename S> struct subst_<Var<K>, N, S> {
-  using type = std::conditional_t<(K == N), S, Var<K - (K > N)>>;
+template <class Action, class T, int Depth = 0> struct walk_ { using type = T; };  // Star, Box, …
+template <VarAction Action, Term T, int Depth = 0> using walk = typename walk_<Action, T, Depth>::type;
+
+template <class Action, int K, int Depth>            struct walk_<Action, Var<K>,    Depth>     { using type = typename Action::template at<K, Depth>; };
+template <class Action, class A, class B, int Depth> struct walk_<Action, App<A, B>, Depth>     { using type = App<walk<Action, A, Depth>, walk<Action, B, Depth>>; };
+template <class Action, class Kind, class A, class B, int Depth>
+                                                     struct walk_<Action, Bind<Kind, A, B>, Depth> { using type = Bind<Kind, walk<Action, A, Depth>, walk<Action, B, Depth + 1>>; };
+
+// =============================================================================
+// (C) Walk actions.  Both lift and subst are instances of the walk scheme:
+//     a tiny per-Var action plus a one-line alias that hands it to walk.
+//     The four-case AST recursion lives in walk; everything below is just
+//     "what to do at a variable, given the current binder depth."
+//
+//       lift<T, D, C>   : add D to every free var of T whose index is ≥ C.
+//       subst<T, N, S>  : replace Var<N> in T with S, decrement free vars > N.
+//                         β-rule: (Lam A B) X → subst<B, 0, X>.
+//
+//     Depth is threaded by walk; the actions consult it so the target Var
+//     and the substituted term stay aligned with the surrounding context.
+// =============================================================================
+template <int Shift, int Cutoff> struct LiftA {
+  template <int K, int Depth> using at = Var<K + Shift * (K >= Cutoff + Depth)>;
 };
-template <typename A, typename B, int N, typename S> struct subst_<Lam<A, B>, N, S> {
-  using type = Lam<subst<A, N, S>, subst<B, N + 1, lift<S, 1>>>;
+template <Term T, int Shift, int Cutoff = 0> using lift = walk<LiftA<Shift, Cutoff>, T>;
+
+template <int Target, class Sub> struct SubstA {
+  template <int K, int Depth>
+  using at = std::conditional_t<(K == Target + Depth),
+                                lift<Sub, Depth>,
+                                Var<K - (K > Target + Depth)>>;
 };
-template <typename A, typename B, int N, typename S> struct subst_<Pi<A, B>, N, S> {
-  using type = Pi<subst<A, N, S>, subst<B, N + 1, lift<S, 1>>>;
-};
-template <typename F, typename X, int N, typename S> struct subst_<App<F, X>, N, S> {
-  using type = App<subst<F, N, S>, subst<X, N, S>>;
-};
+template <Term T, int Target, Term Sub> using subst = walk<SubstA<Target, Sub>, T>;
 
 // =============================================================================
 // (D) β-reduction.
@@ -69,35 +90,32 @@ template <typename F, typename X, int N, typename S> struct subst_<App<F, X>, N,
 //     nf   : full normal form -- whnf, then traverse subterms.
 //     equiv: is_same on normal forms (β-equivalence; we skip η for now).
 // =============================================================================
-template <typename T> struct whnf_ { using type = T; };
-template <typename T> using whnf = typename whnf_<T>::type;
+template <class T> struct whnf_ { using type = T; };
+template <Term T> using whnf = typename whnf_<T>::type;
 
-// App: reduce the head; if it's a Lam, β-reduce, else leave the App neutral.
+// App: reduce the head; if it's a Lam-headed binder, β-reduce, else leave neutral.
 template <typename F, typename X> struct whnf_<App<F, X>> {
 private:
   template <typename Fn> struct go { using type = App<Fn, X>; };
-  template <typename A, typename B> struct go<Lam<A, B>> {
+  template <typename A, typename B> struct go<Bind<LamK, A, B>> {
     using type = whnf<subst<B, 0, X>>;
   };
 public:
   using type = typename go<whnf<F>>::type;
 };
 
-template <typename T> struct nf_traverse_ { using type = T; };
-template <typename T> using nf_traverse = typename nf_traverse_<T>::type;
-template <typename T> using nf = nf_traverse<whnf<T>>;
+template <class T> struct nf_traverse_ { using type = T; };
+template <Term T> using nf_traverse = typename nf_traverse_<T>::type;
+template <Term T> using nf = nf_traverse<whnf<T>>;
 
-template <typename A, typename B> struct nf_traverse_<Lam<A, B>> {
-  using type = Lam<nf<A>, nf<B>>;
-};
-template <typename A, typename B> struct nf_traverse_<Pi<A, B>> {
-  using type = Pi<nf<A>, nf<B>>;
+template <class Kind, class A, class B> struct nf_traverse_<Bind<Kind, A, B>> {
+  using type = Bind<Kind, nf<A>, nf<B>>;
 };
 template <typename F, typename X> struct nf_traverse_<App<F, X>> {
   using type = App<nf<F>, nf<X>>;
 };
 
-template <typename A, typename B>
+template <Term A, Term B>
 inline constexpr bool equiv = std::is_same_v<nf<A>, nf<B>>;
 
 // =============================================================================
@@ -106,46 +124,50 @@ inline constexpr bool equiv = std::is_same_v<nf<A>, nf<B>>;
 // =============================================================================
 template <typename... Ts> struct Ctx {};
 
+template <class T>    constexpr bool is_ctx_v             = false;
+template <Term... Ts> constexpr bool is_ctx_v<Ctx<Ts...>> = true;
+template <class C> concept Context = is_ctx_v<C>;
+
 template <typename T, typename C> struct cons_;
 template <typename T, typename... Ts> struct cons_<T, Ctx<Ts...>> {
   using type = Ctx<T, Ts...>;
 };
-template <typename T, typename C> using cons = typename cons_<T, C>::type;
+template <Term T, Context C> using cons = typename cons_<T, C>::type;
 
 // =============================================================================
 // (F) Bidirectional infer.  App enforces argument-type equivalence via
 //     static_assert; sort/well-formedness checks elided to keep the kernel
 //     tight (callers verify by inspecting the inferred type).
 // =============================================================================
-template <typename Ctx, typename T> struct infer_;
-template <typename Ctx, typename T> using infer = typename infer_<Ctx, T>::type;
+template <class C, class T> struct infer_;
+template <Context C, Term T> using infer = typename infer_<C, T>::type;
 
-template <typename Ctx> struct infer_<Ctx, Star> { using type = Box; };
+template <typename C> struct infer_<C, Star> { using type = Box; };
 
 template <typename... Ts, int N> struct infer_<Ctx<Ts...>, Var<N>> {
   using type = lift<Ts...[N], N + 1>;
 };
 
 // Π's sort is the codomain's sort; we just synthesise it.
-template <typename Ctx, typename A, typename B> struct infer_<Ctx, Pi<A, B>> {
-  using type = infer<cons<A, Ctx>, B>;
+template <class C, class A, class B> struct infer_<C, Bind<PiK, A, B>> {
+  using type = infer<cons<A, C>, B>;
 };
 
 // λ:A. B  has type  Π:A. (type of B in extended Γ)
-template <typename Ctx, typename A, typename B> struct infer_<Ctx, Lam<A, B>> {
-  using type = Pi<A, infer<cons<A, Ctx>, B>>;
+template <class C, class A, class B> struct infer_<C, Bind<LamK, A, B>> {
+  using type = Pi<A, infer<cons<A, C>, B>>;
 };
 
 // (F X) requires F : Π:A. T and X : A; result is T[X/0].
-template <typename Ctx, typename F, typename X> struct infer_<Ctx, App<F, X>> {
+template <typename C, typename F, typename X> struct infer_<C, App<F, X>> {
 private:
   template <typename FT> struct app_;
-  template <typename A, typename T> struct app_<Pi<A, T>> {
-    static_assert(equiv<A, infer<Ctx, X>>, "App: argument type mismatch");
+  template <typename A, typename T> struct app_<Bind<PiK, A, T>> {
+    static_assert(equiv<A, infer<C, X>>, "App: argument type mismatch");
     using type = subst<T, 0, X>;
   };
 public:
-  using type = typename app_<whnf<infer<Ctx, F>>>::type;
+  using type = typename app_<whnf<infer<C, F>>>::type;
 };
 
 // =============================================================================
